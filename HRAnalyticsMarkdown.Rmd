@@ -1,0 +1,472 @@
+---
+title: "<center> Human Resources Analytics </center>"
+author: "David Rothall"
+date: "27 August 2017"
+output:
+  html_document:
+    code_folding: hide
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.width=10)
+```
+
+```{r libraries, echo=FALSE}
+library(knitr)
+library(corrplot)
+library(ggplot2)
+library(cowplot) # Not needed anymore but handy to remember for plotting
+library(dplyr)
+library(tidyr)
+library(formattable)
+library(DT)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+source("multiplot.r")
+```
+# Introduction
+
+### Aims
+
+A 'big company' wants to understand why some of their best and most experienced employees are leaving prematurely. From the insights found, can we use this information to then predict which valuable employees will leave next?
+
+### Goals
+
+* Explore the given dataset and discover insights about the general behaviour of the employees at the company.
+* Use the above insights to identify who the valued employees actually are, and which factors contribute to them leaving the company.  
+* Predict which of our most valued employees in each department of the company will leave next.
+
+### Dataset Structure
+
+We need to achieve the above given the limited information known about the employees. Firstly, what does the data itself look like? Below are the first two rows of the dataset, which contains 14999 rows. This doesn't account for whether employees have been transferred between divisions or have been rehired at some point.
+
+```{r head,  echo=FALSE}
+data <- read.csv("HR_comma_sep.csv")
+head(data, 2)
+```
+
+A summary of the dataset is shown below, along with a table describing each variable:
+
+```{r summary, echo=FALSE}
+summary(data)
+```
+
+| Variable | Description / Notes |
+|----------------------:|:------------------------------------------------|
+| **Satisfaction Level** | A number between 0 and 1 (average employee satisfaction is 61%). |
+| **Performance at Last Evaluation** | A number between 0 and 1 (average employee performance is 72%). |
+| **Number of Projects** | Employees take on between 2 and 7 projects at once, with 3-4 projects being average - it's unclear if this is the correct interpretation or not. |
+| **Monthly Hours Worked** | The average is 201, which is approximately 46 hours / week. |
+| **Time Spent with Company** | We only know data for those who have spent at least 2 years with the company, and so don't know anything about those who have been hired in the past year. The average time spent with the company is 3.5 years. |
+| **Work Accidents** | Either 1 (Yes) or 0 (No). 14% of people have had an accident in the work place. This seems rather high (1 in 7). |
+| **Left** | A binary outcome, i.e. what we are trying to predict. Around 24% of people have left the company at some point. |
+| **Promotion** | Binary - Only 2% of people have been promoted in the last 5 years. |
+| **Department Type (sales variable)** | Most of the people who work in the company are in Sales, Technical or Support roles. |
+| **Salary** | Either low, medium or high although it is unclear as to the actual figures used here. Less than 10% of employees have high salaries, the others are balanced between low and medium salaries. |
+
+<!--______________________________________________________________-->
+# Exploratory Data Analysis
+
+### General Insights
+
+Let's study which variables correlate with each other. The below correlation plot shows some interesting insights:
+
+* An employee's evaluation correlates with their working hours and number of projects worked on at a time.
+* The number of projects worked on by an employee increases the longer they spend with the company (weak correlation)
+* More projects = more hours worked
+* An employee is likelier to be promoted if they are with the company longer (although from the previous section this is still unlikely, also noted by the weak correlation)
+
+```{r edaCorr, fig.height=5}
+data_corr = data %>% select(satisfaction_level:promotion_last_5years)
+M = cor(data_corr)
+
+col1 <- colorRampPalette(c("#7F0000","red","#FF7F00","yellow","white", 
+        "cyan", "#007FFF", "blue","#00007F"))
+par(xpd=TRUE)
+corrplot(M, method='color', col=col1(100), mar=c(2,0,1,0))
+```
+
+Since we are mainly interested in who leaves and who stays, the factors affecting employee attrition in general are:
+
+* Lower satisfaction level 
+* Longer time spent with the company
+* Higher average working hours and the no. of projects worked on have weak correlations with attrition
+* **Not** having an accident (weak correlation)
+
+
+
+<table width="80%">
+<tr>
+<td align="left" valign="top">
+```{r edaWorkAccident}
+# change names of 'left' variable for table readability
+data$left = as.factor(data$left)
+levels(data$left) <- c("Remained", "Left")
+
+workAccidentTable <- data %>% 
+  count(left, Work_accident) %>% 
+  mutate(
+    left = ordered(left, c("Remained", "Left")),
+    n = n
+  ) %>% 
+  spread(left, n) %>% 
+  formattable(align = 'c')
+
+as.htmlwidget(workAccidentTable, width='40%')
+```
+<br>
+The last point of the correlation table is bizarre. If an employee has an accident they are less likely to leave the company than those who haven't had an accident, which is also verified by the above table. Perhaps the compensation scheme is good! 
+<br>
+
+Checking which departments have had staff members injure themselves shows some interesting results. All departments have had quite a few injuries! This is pretty bad. How do accountants even injure themselves, in arguments with their managers? Do sales teams fight each other for customers? The spread of injuries ranges between 12 - 17% across all departments.
+
+</td>
+<td align="right" valign="top">
+```{r edaAccidentVsDepartment}
+data$Work_accident = as.factor(data$Work_accident)
+levels(data$Work_accident) <- c("Not Injured", "Injured")
+
+accidentDeptTable <- data %>% 
+  count(sales, Work_accident) %>% 
+  mutate(
+    Work_accident = ordered(Work_accident, c("Not Injured", "Injured")),
+    n = n
+  ) %>% 
+  spread(Work_accident, n) %>% 
+  formattable(align = 'c')
+
+levels(data$Work_accident) <- c("0", "1")
+data$Work_accident = as.numeric(as.character(data$Work_accident))
+
+as.htmlwidget(accidentDeptTable, width='40%')
+```
+</td>
+</tr>
+</table>
+
+Studying other variables and how they affect attrition are shown below. 
+The employees who have stayed have a balance between low and medium salary. The staff who have quit have a lower salary, generally. High salary earners are very likely to stay. It was previously mentioned that the promotion rate was quite low at 2%. While this had a very weak correlation with staff attrition it is noted that only 0.5% of the employees that left the company were actually promoted.
+
+There are a couple of interesting features of the table displaying staff attrition with the number of projects worked on. Firstly, almost two thirds of employees who are on only 2 projects end up quitting. If staff are placed on either 3 or 4 projects they are a lot more likely to stay, presumably because of having a good work-life balance (the monthly hours worked increases with the number of projects, from the correlation table). Giving an employee either 6 or 7 projects makes them quite likely to leave, with a 100% attrition rate for those given 7 projects.
+
+<br>
+<table width="80%">
+<tr>
+<td align="left" valign="top">
+```{r edaSalaryVsLeft}
+salaryTable <- data %>% 
+  count(left, salary) %>% 
+  mutate(
+    left = ordered(left, c("Remained", "Left")),
+    n = n
+  ) %>% 
+  spread(left, n) %>% 
+  formattable(align = 'c')
+
+as.htmlwidget(salaryTable, width='75%')
+
+promotionsTable <- data %>% 
+  count(left, promotion_last_5years) %>% 
+  mutate(
+    left = ordered(left, c("Remained", "Left")),
+    n = n
+  ) %>% 
+  spread(left, n) %>% 
+  formattable(align = 'c')
+
+as.htmlwidget(promotionsTable, width='40%')
+```
+</td>
+<td align="right" valign="center">
+```{r edaNumProjectsVsLeft}
+projectsTable <- data %>% 
+  count(left, number_project) %>%
+    group_by(number_project) %>%
+  mutate(
+    left = ordered(left, c("Remained", "Left")),
+    n = round(100* n/sum(n), 1)
+  ) %>% 
+  spread(left, n) %>% 
+  formattable(list(area(T, 2:3) ~ color_tile("transparent", "green")), align = 'c')
+
+as.htmlwidget(projectsTable, width='40%')
+```
+</td>
+</tr>
+</table>
+
+### Why do the good employees leave? {.tabset}
+
+Let's stay focused here, and ask ourselves why people are actually leaving or staying. We can separate the employees into these two separate categories, and then analyse that. The following figure shows distributions of the satisfaction level, last evaluation, average monthly hours, and the years at company variables. It appears that each distribution contains bands which are clearly evident in the first 3 plots.
+
+```{r satEvalMonthlyTime}
+levels(data$left) <- c("0", "1")
+data$left = as.numeric(as.character(data$left))
+data_left = data %>% filter(left==1) # Create this before as.factor() call
+data$left = as.factor(data$left) # Need to do this for fill reasons
+
+g1 <- ggplot(data, aes(x=satisfaction_level, fill=left)) + 
+    geom_histogram(binwidth=.01, alpha=.8, position="identity") +
+    scale_fill_manual(values=c("green","red")) +
+    theme(legend.position = 'none') +    
+    labs(x='Satisfaction Level')
+
+g2 <- ggplot(data, aes(x=last_evaluation, fill=left)) + 
+    geom_histogram(binwidth=.01, alpha=.8, position="identity") +
+    scale_fill_manual(values=c("green","red")) +
+    theme(legend.position = 'none') +
+    labs(x='Last Evaulation')
+
+g3 <- ggplot(data, aes(x=average_montly_hours, fill=left)) + 
+    geom_histogram(binwidth=10, alpha=.8, position="identity") +
+    scale_fill_manual(values=c("green","red")) +
+    theme(legend.position = 'none') +
+    labs(x='Av. Monthly Hours')
+
+g4 <- ggplot(data, aes(x=time_spend_company, fill=left)) + 
+    geom_histogram(binwidth=1, alpha=.8, position="identity") +
+    scale_fill_manual(values=c("green","red")) +
+    theme(legend.justification = "top") +
+    labs(x='Years with Company')
+
+multiplot(g1, g2, g3, g4, cols=2)
+```
+
+It appears that most of the staff are at least content with their jobs, having satisfaction levels greater than 0.5. For those who have left, it appears that there are 3 groups that we can study later on, i.e. low, mid and high satisfaction levels. It would be interesting to find out why the happier staff members left their jobs.
+
+The same can be said of the bottom two plots, where the staff members who left can be placed into two bands, i.e. low / high evaluations and low / high working hours respectively. The final plot showing attrition with years worked at the company shows an interesting point in that very few people who have worked at the company for only 2 years have quit. This could be something to investigate in the future as to why this is. 
+
+The attributes of these employees can be summarised by their satisfaction levels as follows:
+
+
+| Variable | Low Satisfaction (less than 0.25) | Mid Satisfaction (Between 0.25 and 0.65) | High Satisfaction (higher than 0.65) |
+|----------------|-------------|----------------|---------------------|
+| **Last Evaluation** | High (> 0.75) | Low (0.5 - 0.6) | Very high (> 0.8) |
+| **Monthly Hours Worked** | 260 - 300 | 140 - 150 | 230 - 260 |
+| **No. Projects** | 6 - 7 | 2 | 4 - 5 |
+| **Years with Company** | 4 | 3 | 5 |
+| **Summary** | Good employees, but are overworked and likely stretched too thin across too many projects. | With worse evaluations they don't get put on more projects. After time they probably get bored and leave the company, or are likely fired. | Having a better work balance than those with low satisfaction levels, these employees most likely leave for either a better paying job, a promotion, or something with less work. |
+
+The data displaying the above summary is shown below.
+
+#### Low Satisfaction
+
+```{r edaLowSatisfaction}
+data_low_satisfaction = data_left %>% filter(satisfaction_level < 0.25)
+par(mfrow=c(2, 2))
+
+hist(data_low_satisfaction$last_evaluation,col="blue", main = "Last Evaluation", xlab="")
+hist(data_low_satisfaction$average_montly_hours,col="blue", main = "Average Monthly Hours", xlab="")
+hist(data_low_satisfaction$number_project,col="blue", main = "Number of Projects", xlab="") 
+hist(data_low_satisfaction$time_spend_company,col="blue", main = "Time Spent with Company (Years)", xlab="", xlim = range(2, 6))
+```
+
+#### Medium Satisfaction
+
+```{r edaMidSatisfaction}
+data_mid_satisfaction = data_left %>% filter(satisfaction_level >= 0.25 & satisfaction_level <= 0.65)
+par(mfrow=c(2, 2))
+
+hist(data_mid_satisfaction$last_evaluation,col="green", main = "Last Evaluation", xlab="")
+hist(data_mid_satisfaction$average_montly_hours,col="green", main = "Average Monthly Hours", xlab="")
+hist(data_mid_satisfaction$number_project,col="green", main = "Number of Projects", xlab="") 
+hist(data_mid_satisfaction$time_spend_company,col="green", main = "Time Spent with Company (Years)", xlab="")
+```
+
+#### High Satisfaction
+
+```{r edaHighSatisfaction}
+data_high_satisfaction = data_left %>% filter(satisfaction_level > 0.65)
+par(mfrow=c(2, 2))
+
+hist(data_high_satisfaction$last_evaluation,col="red", main = "Last Evaluation", xlab="")
+hist(data_high_satisfaction$average_montly_hours,col="red", main = "Average Monthly Hours", xlab="")
+hist(data_high_satisfaction$number_project,col="red", main = "Number of Projects", xlab="") 
+hist(data_high_satisfaction$time_spend_company,col="red", main = "Time Spent with Company (Years)", xlab="")
+```
+
+### Who are the good people in our workforce?
+
+The people we'd want to keep but actually leave instead are the hard workers who get good evaluations, i.e:
+
+* higher than 0.65 last evaluation, AND
+* 4 or more years at company OR work on 4 or more projects
+
+We haven't accounted for employees working a certain number of hours per month here. Since this variable correlates with the total amount of projects worked however, this should still give a good indication of all of the hard working employees in the company.
+
+Let's do another correlation analysis of what factors affect these people and cause them to leave.
+
+```{r edaGoodPeopleCorr, fig.height=5}
+# We now need to keep track of the 'employee number',
+# which is simply the row number of the dataset
+data$employeeNumber <- rownames(data)
+data$left = as.integer(data$left) # Need to do this for fill reasons
+data_good = data %>% filter(last_evaluation >= 0.65 & (time_spend_company >= 4 | number_project >= 4))
+data_good_corr = data_good %>% select(satisfaction_level, number_project:promotion_last_5years)
+
+M_good = cor(data_good_corr)
+
+col1 <- colorRampPalette(c("#7F0000","red","#FF7F00","yellow","white", 
+        "cyan", "#007FFF", "blue","#00007F"))
+
+par(xpd=TRUE)
+corrplot(M_good, method='color', col=col1(100))
+
+```
+
+So now the good employees in the company are likely to leave due to:
+
+* Low satisfaction level
+* A higher number of projects
+* More working hours each month
+* Time with the company (weak correlation, but possibly due to lack of promotions?)
+* Likely a low salary (from the earlier exploratory data analysis)
+
+It's interesting that the inverse correlation between satisfaction level and the number of projects handled and average monthly hours worked are a lot stronger now. Also noted is that the correlation between satisfaction level and attrition is slightly weaker compared to the initial correlation analysis of everyone in the company.
+
+# Modelling
+
+Cross validation was used here instead of splitting the filtered dataset into training and test datasets. This way we can make predictions about our valued employees using the entire dataset without too much overfitting and variance. As shown below the logistic regression and classification tree models have 90% and 93% accuracy respectively, which is still reasonably high. We could have also tried boosting models or random forests here to greatly increase accuracy however avoiding overfitting issues was preferable.
+
+<table width="100%">
+<tr>
+<td align="left" valign="top" width=40%>
+
+#### Logistic Regression
+```{r modelLR}
+# Logistic Regression
+# Convert 'left' to factor variable and implement cross validation
+data_good$left = factor(data_good$left, labels=c('Remained', 'Left'))
+data_good$salary = factor(data_good$salary)
+train_control<- trainControl(method="cv", number=10, repeats=5)
+
+modelglm <- train(left ~ . -satisfaction_level - sales -employeeNumber, data=data_good, trControl=train_control, method='glm', family='binomial')
+predsglm <- predict(modelglm, data_good)
+
+cMatrixglm<- confusionMatrix(predsglm, data_good$left)
+glmSensitivity <- cMatrixglm$byClass[[1]]
+
+# Convert confusion matrix to markdown format
+glmDF <- data.frame("Remained" = cMatrixglm$table[,1], "Left" = cMatrixglm$table[,2], row.names = c("Predicted to stay", "Predicted to leave"))
+
+glmDFformattable <- formattable(glmDF, align = "c", list("Predicted to stay", "Predicted to leave"))
+
+# do summary(modelglm) to view variable significance
+
+as.htmlwidget(glmDFformattable, width='90%')
+```
+
+#### Classification Tree
+```{r modelTrees}
+# train the model 
+modelrpart<- train(left~. -employeeNumber, data=data_good, trControl=train_control, method="rpart")
+# make predictions
+predsrpart<- predict(modelrpart, data_good)
+
+# summarize results
+cMatrixrpart <- confusionMatrix(predsrpart, data_good$left)
+rpartSensitivity <- cMatrixrpart$byClass[[1]]
+
+# Convert confusion matrix to markdown format
+rpartDF <- data.frame("Remained" = cMatrixrpart$table[,1], "Left" = cMatrixrpart$table[,2], row.names = c("Predicted to stay", "Predicted to leave"))
+
+rpartDFformattable <- formattable(rpartDF, align = "c", list("Predicted to stay", "Predicted to leave"))
+
+as.htmlwidget(rpartDFformattable, width='90%')
+```
+</td>
+<td align="right" valign="top" width=60%>
+
+```{r modelTree}
+rpart.plot(modelrpart$finalModel, type = 2, fallen.leaves = F, cex = 1, extra = 2)
+```
+</td>
+<tr>
+</table>
+
+The logistic regression model uses all supplied variables except the satisfaction rating and sales department variables as they were not significant. This model is more complex but less accurate than the tree model shown above, which only requires the employee's satisfaction rating and time spent with the company to categorise attrition, and so we can achieve sufficient accuracy without too much overfitting. The model places employees in 3 separate categories:
+
+1- Highly unsatisfied employees (< 0.11), which quit regardless of their time spent with the company.
+
+2- Employees who are happier with their job remain unless...
+
+3- they have been employed for over 4.5 years and are very happy with their job (>= 0.71)
+
+Points 1 and 2 are quite understandable. From the earlier insights the unhappy staff were quite overworked and presumably left for this reason. Point 3 is a little strange. Why would happy staff members leave their work? We do know that staff members who left were more likely underpaid than others who remain. They most likely found a better offer, with more pay and prospects for promotion however it is suggested to ask any remaining employees for feedback regarding their work environment.
+
+
+We could use the tree model to determine the 200 employees likeliest to leave the company however since they were all in the same part of the tree, they all had the same probability to leave. The logistic regression model being more complex, is better able to rank probabilities so we'll use that to make predictions.
+Let's see which 200 employees both of these models predict are the most likeliest to leave next. Sidenote: view the code to see how the leaving score is calculated - it's based off the predicted leaving probability and the employee's last evaluation.
+
+```{r modelProbLeavingTree}
+# The most valued employees likely have the highest evaluations
+# The ones most likely to leave have leaving probabilities closest to 1
+# We obtain a ranking by using a distance formula - sqrt(x^2 + y^2)
+leavingProbabilityglm <- predict(modelglm, data_good, type='prob')
+
+# Need to grab a few things from our data table, probably easier to 
+# add the prediction model to the employee data, but whatever
+leavingProbabilityglm$employeeNumber <- data_good$employeeNumber
+leavingProbabilityglm$sales <- data_good$sales
+leavingProbabilityglm$salary <- data_good$salary
+leavingProbabilityglm$hasLeft <- data_good$left
+leavingProbabilityglm$last_evaluation <- data_good$last_evaluation
+leavingProbabilityglm$importance <- round(sqrt(leavingProbabilityglm$last_evaluation^2 + leavingProbabilityglm$Left^2), 3)
+
+leavingProbabilityglm <- subset(leavingProbabilityglm, hasLeft == 'Remained')[2:8]
+
+colnames(leavingProbabilityglm)[c(1, 3)] <- c("probLeaving", 'department')
+leavingProbabilityglm$probLeaving <- round(leavingProbabilityglm$probLeaving, 3)
+
+leavingProbabilityglm %>%
+    arrange(desc(importance)) %>%
+    select(employeeNumber, department, salary, probLeaving, last_evaluation, importance) %>%
+    head(200) ->
+    glmProbTable
+
+datatable(glmProbTable, options = list(
+ columnDefs = list(list(className = 'dt-center', targets = c(1, 4, 5, 6)))
+ ))
+```
+
+<table>
+<tr>
+<td align="left" valign="top" width=40%>
+<br>
+<br>
+<br>
+<br>
+The evaluations of all of these staff members are extremely high, so it's vital that we do what we can to keep these guys. On the right is a table showing the number of likely staff membets to leave grouped by department. The observed trend roughly follows the number of people in each department while there are 118 employees with low salaries and 82 with medium salaries. After implementing an action plan to reduce attrition we could contact each department to advise them of which employees are both valued and the likeliest to leave, and focus our efforts on retaining those staff members.
+</td>
+<td align="center" valign="top" width=60%>
+
+```{r modelAttritionByDepartment}
+
+leavingByDept <- glmProbTable %>% 
+  count(department) %>%
+    group_by(department) %>%
+    rename(count = n) %>%
+    arrange(desc(count)) %>%
+  formattable(align = 'l')
+
+as.htmlwidget(leavingByDept, width='40%')
+
+```
+</td>
+</tr>
+</table>
+
+
+## Conclusions
+
+From the tree model, staff members are likelier to remain with the company if their satisfaction rating is above 0.11. If an employee has been with the company for longer than 4.5 years then we should look after those with a satisfaction level of higher than 0.71. We can also tackle staff attrition by addressing the previous insights:
+
+* Give employees who only work 2 projects an extra project, which should allow for staff to feel more engaged with their work and more satisfied. Hopefully this would improve the evaluations of staff members who only work on 2 projects.
+* Reduce the number of projects handled by employees that work on 6 or more at a time. This reduces their monthly working hours and therefore stress levels.
+* Paying more attention to staff who have worked longer in the company, and promoting them if possible.
+* Reducing the number of injuries in the workplace. While this doesn't ppear to have an effect on staff attrition the sheer number of accidents that each departments has is worrying.
+
+It is recommended to focus on the staff members who have a last evaluation of higher than 0.65 and have either been with the company for 4 years or longer, or work on 4 or more projects, since these are our valued employees. We could contact each department to advise them of the 200 most valued employees who are likely to leave, and focus our efforts on retaining those staff members.
