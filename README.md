@@ -1,4 +1,4 @@
-# HRAnalytics
+# Human Resources Analytics - Kaggle Dataset
 This used a practice Kaggle dataset aimed at identifying why the good employees in a company are leaving prematurely. The dataset can be found at https://www.kaggle.com/ludobenistant/hr-analytics.
 
 Please visit http://rpubs.com/the_roth/HRAnalytics for the analysis.
